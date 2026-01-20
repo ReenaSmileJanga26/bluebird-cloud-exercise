@@ -1,0 +1,104 @@
+name: Drift Detection
+
+on:
+  schedule:
+    - cron: "30 3 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write
+  issues: write
+
+env:
+  AWS_REGION: us-east-1
+  DRIFT_ISSUE_TITLE: "Terraform drift detected"
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infrastructure
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.14.3"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          role-session-name: bluebird-drift
+
+      - name: Terraform init
+        run: terraform init -upgrade
+
+      - name: Drift check
+        id: driftcheck
+        run: |
+          set +e
+          terraform plan -detailed-exitcode -no-color 2>&1 | tee /tmp/plan.txt
+          EXITCODE=${PIPESTATUS[0]}
+          echo "exitcode=${EXITCODE}" >> $GITHUB_OUTPUT
+          set -e
+
+          if [ "${EXITCODE}" = "1" ]; then
+            exit 1
+          fi
+
+      - name: Prepare issue body
+        if: steps.driftcheck.outputs.exitcode == '2'
+        run: |
+          echo "## Drift detected" > /tmp/issue.md
+          echo "" >> /tmp/issue.md
+          echo "- Repo: ${{ github.repository }}" >> /tmp/issue.md
+          echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> /tmp/issue.md
+          echo "- UTC: $(date -u)" >> /tmp/issue.md
+          echo "" >> /tmp/issue.md
+          echo "### Plan output (last 200 lines)" >> /tmp/issue.md
+          echo '```' >> /tmp/issue.md
+          tail -n 200 /tmp/plan.txt >> /tmp/issue.md
+          echo '```' >> /tmp/issue.md
+
+      - name: Create or update issue
+        if: steps.driftcheck.outputs.exitcode == '2'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const title = process.env.DRIFT_ISSUE_TITLE;
+            const body = fs.readFileSync('/tmp/issue.md', 'utf8');
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              per_page: 100
+            });
+
+            const existing = issues.find(i => i.title === title);
+
+            if (existing) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ["drift", "terraform"]
+              });
+            }
+
+      - name: No drift
+        if: steps.driftcheck.outputs.exitcode == '0'
+        run: echo "No drift detected."

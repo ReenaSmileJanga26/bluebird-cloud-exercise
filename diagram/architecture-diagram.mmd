@@ -1,0 +1,104 @@
+flowchart TB
+
+  %% External users
+  USER["Users / Browsers"] -->|"HTTP 80 / HTTPS 443"| ALB
+
+  %% AWS region boundary
+  subgraph REGION["AWS Region: us-east-1"]
+    direction TB
+
+    %% VPC boundary
+    subgraph VPC["VPC: 10.20.0.0/16 (security boundary)"]
+      direction TB
+
+      %% Public zone (internet-facing)
+      subgraph PUBLIC["Public subnets (2 AZs) - internet facing"]
+        direction LR
+        IGW["Internet Gateway"]
+        ALB["Application Load Balancer"]
+        NAT["NAT Gateway (single for cost)"]
+      end
+
+      %% Private app zone
+      subgraph APP["Private app subnets (2 AZs) - application zone"]
+        direction TB
+        TG["ALB Target Group (type: ip)"]
+        ECS["ECS Cluster"]
+        SVC["ECS Service (Fargate) desired=2 max=4"]
+        TASKA["Fargate Task (AZ-a) port 3000"]
+        TASKB["Fargate Task (AZ-b) port 3000"]
+      end
+
+      %% Private data zone
+      subgraph DATA["Private DB subnets (2 AZs) - data zone"]
+        direction TB
+        RDS["RDS PostgreSQL (Multi-AZ) encrypted backups"]
+      end
+
+      %% VPC endpoints (private connectivity)
+      subgraph ENDPOINTS["VPC Endpoints (private access)"]
+        direction TB
+        VPCE_ECR_API["Interface VPCE: ECR API"]
+        VPCE_ECR_DKR["Interface VPCE: ECR DKR"]
+        VPCE_LOGS["Interface VPCE: CloudWatch Logs"]
+        VPCE_SM["Interface VPCE: Secrets Manager"]
+        VPCE_S3["Gateway VPCE: S3"]
+      end
+
+      %% Security group boundary (policy boundary)
+      subgraph SG["Security Groups (policy boundary)"]
+        direction TB
+        SG_ALB["ALB SG: in 80/443 from internet; out to ECS 3000"]
+        SG_ECS["ECS SG: in 3000 from ALB SG; out 5432 to DB; out 443 to endpoints"]
+        SG_RDS["RDS SG: in 5432 from ECS SG"]
+      end
+
+      %% Network flow
+      ALB -->|"L7 forward"| TG
+      TG -->|"HTTP 3000"| SVC
+      SVC --> TASKA
+      SVC --> TASKB
+
+      %% Data flow: app to DB
+      TASKA -->|"SQL 5432"| RDS
+      TASKB -->|"SQL 5432"| RDS
+
+      %% Data flow: image pull / logs / secrets / S3 via endpoints
+      TASKA -->|"HTTPS 443 pull image"| VPCE_ECR_API
+      TASKA -->|"HTTPS 443 pull layers"| VPCE_ECR_DKR
+      TASKB -->|"HTTPS 443 pull image"| VPCE_ECR_API
+      TASKB -->|"HTTPS 443 pull layers"| VPCE_ECR_DKR
+
+      TASKA -->|"HTTPS 443 write logs"| VPCE_LOGS
+      TASKB -->|"HTTPS 443 write logs"| VPCE_LOGS
+
+      TASKA -->|"HTTPS 443 read DB creds"| VPCE_SM
+      TASKB -->|"HTTPS 443 read DB creds"| VPCE_SM
+
+      TASKA -->|"S3 access"| VPCE_S3
+      TASKB -->|"S3 access"| VPCE_S3
+
+      %% Outbound internet path (fallback for non-endpoint traffic)
+      TASKA -->|"other egress"| NAT --> IGW
+      TASKB -->|"other egress"| NAT --> IGW
+
+      %% SG mapping (logical)
+      SG_ALB -. "controls" .-> ALB
+      SG_ECS -. "controls" .-> TASKA
+      SG_ECS -. "controls" .-> TASKB
+      SG_RDS -. "controls" .-> RDS
+    end
+
+    %% Managed AWS services outside VPC
+    ECR["Amazon ECR"]
+    CW["CloudWatch (logs, metrics, alarms)"]
+    SM["Secrets Manager"]
+    S3["S3 static bucket (encryption, lifecycle)"]
+  end
+
+  %% Endpoint to service mapping
+  VPCE_ECR_API -->|"PrivateLink"| ECR
+  VPCE_ECR_DKR -->|"PrivateLink"| ECR
+  VPCE_LOGS -->|"PrivateLink"| CW
+  VPCE_SM -->|"PrivateLink"| SM
+  VPCE_S3 -->|"Gateway route"| S3

@@ -1,0 +1,85 @@
+name: Infra CI
+
+on:
+  pull_request:
+    paths: ["infrastructure/**", ".github/workflows/infra-ci.yml"]
+  push:
+    branches: ["main"]
+    paths: ["infrastructure/**", ".github/workflows/infra-ci.yml"]
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  terraform_checks:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infrastructure
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.14.3"
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          role-session-name: bluebird-infra-ci
+
+      - name: Terraform init
+        run: terraform init -upgrade
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+
+      - name: TFLint
+        run: |
+          tflint --init
+          tflint
+
+      - name: Install tfsec
+        run: curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+
+      - name: tfsec scan
+        run: tfsec .
+
+      - name: Terraform plan (for cost)
+        run: terraform plan -out=tfplan
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Infracost breakdown
+        run: infracost breakdown --path=tfplan --format=json --out-file=/tmp/infracost.json
+
+      - name: Infracost comment on PR (CLI)
+        if: github.event_name == 'pull_request'
+        run: |
+          infracost comment github \
+            --path=/tmp/infracost.json \
+            --repo=$GITHUB_REPOSITORY \
+            --github-token=${{ github.token }} \
+            --pull-request=${{ github.event.pull_request.number }} \
+            --behavior=update
+
+      - name: Infracost output on main
+        if: github.event_name == 'push'
+        run: infracost output --path=/tmp/infracost.json --format=table

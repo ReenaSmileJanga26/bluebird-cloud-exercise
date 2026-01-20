@@ -1,0 +1,13 @@
+project_name = "bluebird"
+environment  = "dev"
+aws_region   = "us-east-1"
+
+app_port    = 3000
+health_path = "/health"
+
+desired_count = 2
+max_count     = 4
+
+enable_vpc_endpoints = true
+
+# app_image is set by release pipeline via TF_VAR_app_image
